@@ -59,33 +59,10 @@ public class UPnPService: Equatable, Identifiable, Hashable, @unchecked Sendable
     private var serviceDefinition: UPnPServiceDefinition?
     
     private let eventPublisher: AnyPublisher<(String, Data), Never>?
-    private var _subscribedEventPublisher: AnyPublisher<Data, Never>?
+    private let subscribedEventSubject = PassthroughSubject<Data, Never>()
     /// The events of this service, recognized by the id of the current subscription.
-    ///
-    /// Both this publisher and the id it filters on are reached from whatever thread an event
-    /// arrives on as well as from the maintenance loop, so both are guarded by `stateLock`.
     internal var subscribedEventPublisher: AnyPublisher<Data, Never> {
-        stateLock.lock(); defer { stateLock.unlock() }
-
-        if let _subscribedEventPublisher { return _subscribedEventPublisher }
-
-        let publisher: AnyPublisher<Data, Never>
-        if let eventPublisher {
-            publisher = eventPublisher.share()
-                .filter { [weak self] in
-                    self?.subscriptionId == $0.0
-                }
-                .map {
-                    $0.1
-                }
-                .eraseToAnyPublisher()
-        }
-        else {
-            publisher = Empty().eraseToAnyPublisher()
-        }
-
-        _subscribedEventPublisher = publisher
-        return publisher
+        subscribedEventSubject.eraseToAnyPublisher()
     }
 
     private var _subscriptionId: String?
@@ -98,7 +75,43 @@ public class UPnPService: Equatable, Identifiable, Hashable, @unchecked Sendable
     @MainActor
     private func setSubcriptionStatus(_ subscriptionStatus: SubscriptionStatus, subscriptionId: String?) {
         self.subscriptionStatus = subscriptionStatus
-        self.subscriptionId = subscriptionId
+
+        var bufferedEvents = [Data]()
+        var shouldFlushBufferedEvents = false
+
+        stateLock.lock()
+        switch subscriptionStatus {
+        case .subscribing:
+            // A renderer may send its initial NOTIFY before it returns the SUBSCRIBE response.
+            // The SID is only known from that response, so temporarily retain events by SID.
+            _subscriptionId = nil
+            _isWaitingForSubscriptionId = true
+            _isFlushingBufferedEvents = false
+            _bufferedEvents.removeAll()
+        case .subscribed:
+            shouldFlushBufferedEvents = _isWaitingForSubscriptionId || _subscriptionId != subscriptionId
+            _subscriptionId = subscriptionId
+            _isWaitingForSubscriptionId = false
+
+            if shouldFlushBufferedEvents, let subscriptionId {
+                _isFlushingBufferedEvents = true
+                bufferedEvents = _bufferedEvents.removeValue(forKey: subscriptionId) ?? []
+                _bufferedEvents.removeAll()
+            }
+        case .renewing:
+            _subscriptionId = subscriptionId
+            _isWaitingForSubscriptionId = false
+        case .unsubscribed, .unsubscribing, .failed:
+            _subscriptionId = subscriptionId
+            _isWaitingForSubscriptionId = false
+            _isFlushingBufferedEvents = false
+            _bufferedEvents.removeAll()
+        }
+        stateLock.unlock()
+
+        if shouldFlushBufferedEvents, let subscriptionId {
+            flushBufferedEvents(bufferedEvents, for: subscriptionId)
+        }
     }
 
     /// The task that keeps the subscription alive. Its presence means a subscription is wanted;
@@ -151,8 +164,14 @@ public class UPnPService: Equatable, Identifiable, Hashable, @unchecked Sendable
     private let stateLock = NSLock()
     private var _lastEventReceived: Date?
     private var _subscriptionActiveSince: Date?
+    private var _isWaitingForSubscriptionId = false
+    private var _isFlushingBufferedEvents = false
+    private var _bufferedEvents = [String: [Data]]()
+    private static let maximumBufferedEventsPerSubscription = 8
     @MainActor
     private var eventObserver: AnyCancellable?
+    @MainActor
+    private var rawEventObserver: AnyCancellable?
 
     /// When the last state change for this service was received, or nil if nothing was received
     /// since the current subscription was established.
@@ -185,12 +204,65 @@ public class UPnPService: Equatable, Identifiable, Hashable, @unchecked Sendable
         stateLock.lock()
         _subscriptionActiveSince = nil
         _lastEventReceived = nil
+        _isWaitingForSubscriptionId = false
+        _isFlushingBufferedEvents = false
+        _bufferedEvents.removeAll()
         stateLock.unlock()
+    }
+
+    /// Match registry events to this service. Initial events are buffered while the SUBSCRIBE
+    /// response (and therefore its SID) is still in flight.
+    private func receiveEvent(subscriptionId: String, data: Data) {
+        var shouldDeliver = false
+
+        stateLock.lock()
+        if _subscriptionId == subscriptionId, _isFlushingBufferedEvents == false {
+            shouldDeliver = true
+        }
+        else if _isWaitingForSubscriptionId || (_subscriptionId == subscriptionId && _isFlushingBufferedEvents) {
+            var events = _bufferedEvents[subscriptionId] ?? []
+            events.append(data)
+            if events.count > Self.maximumBufferedEventsPerSubscription {
+                events.removeFirst(events.count - Self.maximumBufferedEventsPerSubscription)
+            }
+            _bufferedEvents[subscriptionId] = events
+        }
+        stateLock.unlock()
+
+        if shouldDeliver {
+            subscribedEventSubject.send(data)
+        }
+    }
+
+    /// Drain events in arrival order. Events arriving during the drain are appended and handled by
+    /// the next pass, preventing a newer live event from being delivered before the initial state.
+    private func flushBufferedEvents(_ initialEvents: [Data], for subscriptionId: String) {
+        var events = initialEvents
+
+        while true {
+            events.forEach { subscribedEventSubject.send($0) }
+
+            stateLock.lock()
+            events = _bufferedEvents.removeValue(forKey: subscriptionId) ?? []
+            if events.isEmpty {
+                _isFlushingBufferedEvents = false
+                stateLock.unlock()
+                return
+            }
+            stateLock.unlock()
+        }
     }
 
     /// Record incoming events, so that a subscription that stopped delivering can be detected.
     @MainActor
     private func observeEventsIfNeeded() {
+        if rawEventObserver == nil {
+            rawEventObserver = eventPublisher?
+                .sink { [weak self] subscriptionId, data in
+                    self?.receiveEvent(subscriptionId: subscriptionId, data: data)
+                }
+        }
+
         guard eventObserver == nil else { return }
 
         eventObserver = subscribedEventPublisher

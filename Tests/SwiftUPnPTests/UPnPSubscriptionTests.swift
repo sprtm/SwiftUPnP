@@ -9,6 +9,7 @@
 
 import XCTest
 import Mocker
+import Combine
 @testable import SwiftUPnP
 
 /// Stands in for the event subscription endpoint of a device, so subscribing can be tested without
@@ -28,6 +29,7 @@ private final class FakeEventEndpoint {
     private var _answer = Answer.granted(timeout: "Second-120")
     private var _subscribeCount = 0
     private var _unsubscribeCount = 0
+    var beforeSubscribeResponse: ((String) -> Void)?
     let port: UInt16
 
     var answer: Answer {
@@ -51,12 +53,16 @@ private final class FakeEventEndpoint {
             case "SUBSCRIBE":
                 self.lock.lock()
                 self._subscribeCount += 1
+                let subscribeCount = self._subscribeCount
                 let answer = self._answer
+                let beforeSubscribeResponse = self.beforeSubscribeResponse
                 self.lock.unlock()
 
                 switch answer {
                 case let .granted(timeout):
-                    var headers = ["SID": "uuid:subscription-\(self.subscribeCount)"]
+                    let subscriptionId = "uuid:subscription-\(subscribeCount)"
+                    beforeSubscribeResponse?(subscriptionId)
+                    var headers = ["SID": subscriptionId]
                     if let timeout {
                         headers["TIMEOUT"] = timeout
                     }
@@ -94,6 +100,7 @@ final class UPnPSubscriptionTests: XCTestCase {
     private var endpoint: FakeEventEndpoint!
     private var device: UPnPDevice!
     private var service: UPnPService!
+    private var eventSubject: PassthroughSubject<(String, Data), Never>!
 
     override func setUp() async throws {
         endpoint = try await FakeEventEndpoint()
@@ -109,13 +116,14 @@ final class UPnPSubscriptionTests: XCTestCase {
                                                                         deviceType: "urn:test:device:Source:1",
                                                                         url: URL(string: "\(base)/desc.xml")!,
                                                                         lastSeen: Date()))
+        eventSubject = PassthroughSubject<(String, Data), Never>()
         service = UPnPService(device: device,
                               controlUrl: URL(string: "\(base)/control")!,
                               scpdUrl: URL(string: "\(base)/desc.xml")!,
                               eventUrl: URL(string: "\(base)/event")!,
                               serviceType: "urn:test:service:Time:1",
                               serviceId: "urn:test:serviceId:Time",
-                              eventPublisher: nil,
+                              eventPublisher: eventSubject.eraseToAnyPublisher(),
                               eventCallbackUrl: URL(string: "\(base)/callback")!)
     }
 
@@ -125,6 +133,7 @@ final class UPnPSubscriptionTests: XCTestCase {
         device = nil
         endpoint.stopListening()
         endpoint = nil
+        eventSubject = nil
     }
 
     /// A single request that doesn't arrive - a player that is rebooting, a network hiccup - used to
@@ -185,6 +194,26 @@ final class UPnPSubscriptionTests: XCTestCase {
 
         await service.subscribeToEvents()
         try await waitUntilSubscribed()
+    }
+
+    /// OpenHome renderers commonly send their initial state before the SUBSCRIBE response reaches
+    /// the control point. That event must be retained until its SID can be matched to this service.
+    func testAnInitialEventSentBeforeTheSubscribeResponseIsDelivered() async throws {
+        let expected = Data("initial state".utf8)
+        let received = expectation(description: "initial event delivered")
+        var cancellable: AnyCancellable?
+
+        cancellable = service.subscribedEventPublisher.sink { data in
+            XCTAssertEqual(data, expected)
+            received.fulfill()
+        }
+        endpoint.beforeSubscribeResponse = { [eventSubject] subscriptionId in
+            eventSubject?.send((subscriptionId, expected))
+        }
+
+        await service.subscribeToEvents()
+        await fulfillment(of: [received], timeout: 2)
+        withExtendedLifetime(cancellable) {}
     }
 
     /// What the watchdog in a status monitor uses to tell a subscription that stopped delivering
