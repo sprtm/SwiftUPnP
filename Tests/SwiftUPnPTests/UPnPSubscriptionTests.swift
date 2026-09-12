@@ -216,6 +216,46 @@ final class UPnPSubscriptionTests: XCTestCase {
         withExtendedLifetime(cancellable) {}
     }
 
+    /// Exercise the generated OpenHome parser as well as the base subscription publisher, using
+    /// the same event shape sent by upmpdcli.
+    func testAnEarlyOpenHomeTimeEventReachesTheGeneratedStatePublisher() async throws {
+        let timeService = OpenHomeTime1Service(
+            device: device,
+            controlUrl: service.controlUrl,
+            scpdUrl: service.scpdUrl,
+            eventUrl: service.eventUrl,
+            serviceType: service.serviceType,
+            serviceId: service.serviceId,
+            eventPublisher: eventSubject.eraseToAnyPublisher(),
+            eventCallbackUrl: service.eventCallbackUrl
+        )
+        service = timeService
+
+        let xml = Data("""
+        <e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
+          <e:property><Seconds>120</Seconds></e:property>
+          <e:property><Duration>316</Duration></e:property>
+          <e:property><TrackCount>315</TrackCount></e:property>
+        </e:propertyset>
+        """.utf8)
+        let received = expectation(description: "parsed OpenHome Time state delivered")
+        var cancellable: AnyCancellable?
+
+        cancellable = timeService.stateSubject.sink { state in
+            XCTAssertEqual(state.seconds, 120)
+            XCTAssertEqual(state.duration, 316)
+            XCTAssertEqual(state.trackCount, 315)
+            received.fulfill()
+        }
+        endpoint.beforeSubscribeResponse = { [eventSubject] subscriptionId in
+            eventSubject?.send((subscriptionId, xml))
+        }
+
+        await timeService.subscribeToEvents()
+        await fulfillment(of: [received], timeout: 2)
+        withExtendedLifetime(cancellable) {}
+    }
+
     /// What the watchdog in a status monitor uses to tell a subscription that stopped delivering
     /// from a player that has nothing to report.
     func testSilenceIsOnlyReportedWhileSubscribed() async throws {

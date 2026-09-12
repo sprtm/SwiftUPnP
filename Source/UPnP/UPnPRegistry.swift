@@ -84,7 +84,11 @@ public class UPnPRegistry {
             guard request.method == "NOTIFY" else { return .internalServerError("Only handling NOTIFY") }
 
             if let sid = request.header("SID") {
+                print("[SwiftUPnP callback] NOTIFY sid=\(sid) bytes=\(request.body.count)")
                 self.eventSubject.send((sid, request.body))
+            }
+            else {
+                print("[SwiftUPnP callback] Ignored NOTIFY without SID bytes=\(request.body.count)")
             }
 
             return .ok()

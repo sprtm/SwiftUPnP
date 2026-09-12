@@ -214,6 +214,7 @@ public class UPnPService: Equatable, Identifiable, Hashable, @unchecked Sendable
     /// response (and therefore its SID) is still in flight.
     private func receiveEvent(subscriptionId: String, data: Data) {
         var shouldDeliver = false
+        var didBuffer = false
 
         stateLock.lock()
         if _subscriptionId == subscriptionId, _isFlushingBufferedEvents == false {
@@ -226,11 +227,16 @@ public class UPnPService: Equatable, Identifiable, Hashable, @unchecked Sendable
                 events.removeFirst(events.count - Self.maximumBufferedEventsPerSubscription)
             }
             _bufferedEvents[subscriptionId] = events
+            didBuffer = true
         }
         stateLock.unlock()
 
         if shouldDeliver {
+            print("[SwiftUPnP event] Matched sid=\(subscriptionId) service=\(serviceType) bytes=\(data.count)")
             subscribedEventSubject.send(data)
+        }
+        else if didBuffer {
+            print("[SwiftUPnP event] Buffered early sid=\(subscriptionId) service=\(serviceType) bytes=\(data.count)")
         }
     }
 
@@ -238,6 +244,8 @@ public class UPnPService: Equatable, Identifiable, Hashable, @unchecked Sendable
     /// the next pass, preventing a newer live event from being delivered before the initial state.
     private func flushBufferedEvents(_ initialEvents: [Data], for subscriptionId: String) {
         var events = initialEvents
+
+        print("[SwiftUPnP event] Replaying sid=\(subscriptionId) service=\(serviceType) events=\(events.count)")
 
         while true {
             events.forEach { subscribedEventSubject.send($0) }
